@@ -213,29 +213,39 @@ class EventSource extends (EventTarget(...EVENT_SOURCE_EVENTS): any) {
     }
 
     let pos: number = 0;
-    while (pos < chunk.length) {
-      if (this._discardNextLineFeed) {
-        if (chunk.charCodeAt(pos) === lf) {
-          // Ignore this LF since it was preceded by a CR
-          ++pos;
+    const processNextChunk = () => {
+      while (pos < chunk.length) {
+        if (this._discardNextLineFeed) {
+          if (chunk.charCodeAt(pos) === lf) {
+            // Ignore this LF since it was preceded by a CR
+            ++pos;
+          }
+          this._discardNextLineFeed = false;
         }
-        this._discardNextLineFeed = false;
-      }
 
-      const curCharCode = chunk.charCodeAt(pos);
-      if (curCharCode === cr || curCharCode === lf) {
-        this.__processEventStreamLine();
+        const curCharCode = chunk.charCodeAt(pos);
+        if (curCharCode === cr || curCharCode === lf) {
+          this.__processEventStreamLine();
 
-        // Treat CRLF properly
-        if (curCharCode === cr) {
-          this._discardNextLineFeed = true;
+          // Treat CRLF properly
+          if (curCharCode === cr) {
+            this._discardNextLineFeed = true;
+          }
+        } else {
+          this._lineBuf += chunk.charAt(pos);
         }
-      } else {
-        this._lineBuf += chunk.charAt(pos);
-      }
 
-      ++pos;
-    }
+        ++pos;
+
+        // Free event loop
+        if (pos % 1000 === 0) {
+          setTimeout(processNextChunk, 0);
+          return;
+        }
+      }
+    };
+
+    processNextChunk();
   }
 
   __processEventStreamLine(): void {
@@ -269,188 +279,190 @@ class EventSource extends (EventTarget(...EVENT_SOURCE_EVENTS): any) {
     } else {
       field = line;
       value = '';
+      }
+
+      switch (field) {
+        case 'event':
+          // Set the type of this event
+          this._eventTypeBuf = value;
+          break;
+        case 'data':
+          // Append the line to the data buffer along with an LF (U+000A)
+          this._dataBuf += value;
+          this._dataBuf += String.fromCodePoint(lf);
+          break;
+        case 'id':
+          // Update the last seen event id
+          this._lastEventIdBuf = value;
+          break;
+        case 'retry':
+          // Set a new reconnect interval value
+          const newRetryMs = parseInt(value, 10);
+          if (!isNaN(newRetryMs)) {
+            this._reconnectIntervalMs = newRetryMs;
+          }
+          break;
+        default:
+        // this is an unrecognized field, so this line should be ignored
+      }
     }
 
-    switch (field) {
-      case 'event':
-        // Set the type of this event
-        this._eventTypeBuf = value;
-        break;
-      case 'data':
-        // Append the line to the data buffer along with an LF (U+000A)
-        this._dataBuf += value;
-        this._dataBuf += String.fromCodePoint(lf);
-        break;
-      case 'id':
-        // Update the last seen event id
-        this._lastEventIdBuf = value;
-        break;
-      case 'retry':
-        // Set a new reconnect interval value
-        const newRetryMs = parseInt(value, 10);
-        if (!isNaN(newRetryMs)) {
-          this._reconnectIntervalMs = newRetryMs;
-        }
-        break;
-      default:
-      // this is an unrecognized field, so this line should be ignored
-    }
-  }
-
-  __dispatchBufferedEvent() {
+    __dispatchBufferedEvent() {
     this._lastEventId = this._lastEventIdBuf;
 
     // If the data buffer is an empty string, set the event type buffer to
-    // empty string and return
-    if (this._dataBuf === '') {
-      this._eventTypeBuf = '';
-      return;
-    }
+// empty string and return
+if (this._dataBuf === '') {
+  this._eventTypeBuf = '';
+  return;
+}
 
-    // Dispatch the event
-    const eventType = this._eventTypeBuf || 'message';
+// Dispatch the event
+const eventType = this._eventTypeBuf || 'message';
+this.dispatchEvent({
+  type: eventType,
+  data: this._dataBuf.slice(0, -1), // remove the trailing LF from the data
+  origin: this.url,
+  lastEventId: this._lastEventId,
+});
+
+// Reset the data and event type buffers
+this._dataBuf = '';
+this._eventTypeBuf = '';
+
+}
+
+// Networking callbacks, exposed for testing
+
+__didCreateRequest(requestId: number): void {
+this._requestId = requestId;
+}
+
+__didReceiveResponse(
+requestId: number,
+status: number,
+responseHeaders: ?Object,
+responseURL: ?string,
+): void {
+if (requestId !== this._requestId) {
+return;
+}
+
+if (responseHeaders) {
+  // make the header names case insensitive
+  for (const entry of Object.entries(responseHeaders)) {
+    const [key, value] = entry;
+    delete responseHeaders[key];
+    responseHeaders[key.toLowerCase()] = value;
+  }
+}
+
+// Handle redirects
+if (status === 301 || status === 307) {
+  if (responseHeaders && responseHeaders.location) {
+    // set the new URL, set the requestId to null so that request
+    // completion doesn't attempt a reconnect, and immediately attempt
+    // reconnecting
+    this.url = responseHeaders.location;
+    this._requestId = null;
+    this.__connnect();
+    return;
+  } else {
     this.dispatchEvent({
-      type: eventType,
-      data: this._dataBuf.slice(0, -1), // remove the trailing LF from the data
-      origin: this.url,
-      lastEventId: this._lastEventId,
+      type: 'error',
+      data: 'got redirect with no location',
     });
-
-    // Reset the data and event type buffers
-    this._dataBuf = '';
-    this._eventTypeBuf = '';
+    return this.close();
   }
+}
 
-  // Networking callbacks, exposed for testing
+if (status !== 200) {
+  this.dispatchEvent({
+    type: 'error',
+    data: 'unexpected HTTP status ' + status,
+  });
+  return this.close();
+}
 
-  __didCreateRequest(requestId: number): void {
-    this._requestId = requestId;
-  }
+if (
+  responseHeaders &&
+  responseHeaders['content-type'] !== 'text/event-stream'
+) {
+  this.dispatchEvent({
+    type: 'error',
+    data:
+      'unsupported MIME type in response: ' +
+      responseHeaders['content-type'],
+  });
+  return this.close();
+} else if (!responseHeaders) {
+  this.dispatchEvent({
+    type: 'error',
+    data: 'no MIME type in response',
+  });
+  return this.close();
+}
 
-  __didReceiveResponse(
-    requestId: number,
-    status: number,
-    responseHeaders: ?Object,
-    responseURL: ?string,
-  ): void {
-    if (requestId !== this._requestId) {
-      return;
-    }
+// reset the connection retry attempt counter
+this._retryAttempts = 0;
 
-    if (responseHeaders) {
-      // make the header names case insensitive
-      for (const entry of Object.entries(responseHeaders)) {
-        const [key, value] = entry;
-        delete responseHeaders[key];
-        responseHeaders[key.toLowerCase()] = value;
-      }
-    }
+// reset the stream processing buffers
+this._isFirstChunk = false;
+this._discardNextLineFeed = false;
+this._lineBuf = '';
+this._dataBuf = '';
+this._eventTypeBuf = '';
+this._lastEventIdBuf = '';
 
-    // Handle redirects
-    if (status === 301 || status === 307) {
-      if (responseHeaders && responseHeaders.location) {
-        // set the new URL, set the requestId to null so that request
-        // completion doesn't attempt a reconnect, and immediately attempt
-        // reconnecting
-        this.url = responseHeaders.location;
-        this._requestId = null;
-        this.__connnect();
-        return;
-      } else {
-        this.dispatchEvent({
-          type: 'error',
-          data: 'got redirect with no location',
-        });
-        return this.close();
-      }
-    }
+this.readyState = EventSource.OPEN;
+this.dispatchEvent({type: 'open'});
 
-    if (status !== 200) {
-      this.dispatchEvent({
-        type: 'error',
-        data: 'unexpected HTTP status ' + status,
-      });
-      return this.close();
-    }
+}
 
-    if (
-      responseHeaders &&
-      responseHeaders['content-type'] !== 'text/event-stream'
-    ) {
-      this.dispatchEvent({
-        type: 'error',
-        data:
-          'unsupported MIME type in response: ' +
-          responseHeaders['content-type'],
-      });
-      return this.close();
-    } else if (!responseHeaders) {
-      this.dispatchEvent({
-        type: 'error',
-        data: 'no MIME type in response',
-      });
-      return this.close();
-    }
+__didReceiveIncrementalData(
+requestId: number,
+responseText: string,
+progress: number,
+total: number,
+) {
+if (requestId !== this._requestId) {
+return;
+}
 
-    // reset the connection retry attempt counter
-    this._retryAttempts = 0;
+this.__processEventStreamChunk(responseText);
 
-    // reset the stream processing buffers
-    this._isFirstChunk = false;
-    this._discardNextLineFeed = false;
-    this._lineBuf = '';
-    this._dataBuf = '';
-    this._eventTypeBuf = '';
-    this._lastEventIdBuf = '';
+}
 
-    this.readyState = EventSource.OPEN;
-    this.dispatchEvent({type: 'open'});
-  }
-
-  __didReceiveIncrementalData(
-    requestId: number,
-    responseText: string,
-    progress: number,
-    total: number,
-  ) {
-    if (requestId !== this._requestId) {
-      return;
-    }
-
-    this.__processEventStreamChunk(responseText);
-  }
-
-  __didCompleteResponse(
-    requestId: number,
-    error: string,
-    timeOutError: boolean,
-  ): void {
-    if (requestId !== this._requestId) {
-      return;
-    }
-
-    // The spec states: 'Network errors that prevents the connection from being
-    // established in the first place (e.g. DNS errors), should cause the user
-    // agent to reestablish the connection in parallel, unless the user agent
-    // knows that to be futile, in which case the user agent may fail the
-    // connection.'
-    //
-    // We are treating 5 unnsuccessful retry attempts as a sign that attempting
-    // to reconnect is 'futile'. Future improvements could also add exponential
-    // backoff.
-    if (this._retryAttempts < maxRetryAttempts) {
-      // pass along the error message so that the user sees it as part of the
-      // error event fired for re-establishing the connection
-      this._retryAttempts += 1;
-      this.__reconnect(error);
-    } else {
-      this.dispatchEvent({
-        type: 'error',
-        data: 'could not reconnect after ' + maxRetryAttempts + ' attempts',
-      });
-      this.close();
-    }
-  }
+__didCompleteResponse(
+requestId: number,
+error: string,
+timeOutError: boolean,
+): void {
+if (requestId !== this._requestId) {
+return;
+}
+// The spec states: 'Network errors that prevents the connection from being
+// established in the first place (e.g. DNS errors), should cause the user
+// agent to reestablish the connection in parallel, unless the user agent
+// knows that to be futile, in which case the user agent may fail the
+// connection.'
+//
+// We are treating 5 unnsuccessful retry attempts as a sign that attempting
+// to reconnect is 'futile'. Future improvements could also add exponential
+// backoff.
+if (this._retryAttempts < maxRetryAttempts) {
+  // pass along the error message so that the user sees it as part of the
+  // error event fired for re-establishing the connection
+  this._retryAttempts += 1;
+  this.__reconnect(error);
+} else {
+  this.dispatchEvent({
+    type: 'error',
+    data: 'could not reconnect after ' + maxRetryAttempts + ' attempts',
+  });
+  this.close();
+}
+}
 }
 
 module.exports = EventSource;
