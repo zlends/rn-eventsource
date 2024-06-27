@@ -237,75 +237,77 @@ class EventSource extends (EventTarget(...EVENT_SOURCE_EVENTS): any) {
 
         ++pos;
 
-        // Free event loop
-        if (pos % 100 === 0) {
+        // Отпускаем event loop
+        if (pos % 1000 === 0) {
           setTimeout(processNextChunk, 0);
           return;
         }
       }
+      // Вызовем обработку следующей части данных после завершения текущей части
+      this.__processEventStreamLine();
     };
 
     processNextChunk();
+}
+
+__processEventStreamLine(): void {
+  const line = this._lineBuf;
+
+  // clear the line buffer
+  this._lineBuf = '';
+
+  // Dispatch the buffered event if this is an empty line
+  if (line === '') {
+    this.__dispatchBufferedEvent();
+    return;
   }
 
-  __processEventStreamLine(): void {
-    const line = this._lineBuf;
+  const colonPos = line.indexOf(':');
 
-    // clear the line buffer
-    this._lineBuf = '';
+  let field: string;
+  let value: string;
 
-    // Dispatch the buffered event if this is an empty line
-    if (line === '') {
-      this.__dispatchBufferedEvent();
-      return;
-    }
-
-    const colonPos = line.indexOf(':');
-
-    let field: string;
-    let value: string;
-
-    if (colonPos === 0) {
-      // this is a comment line and should be ignored
-      return;
-    } else if (colonPos > 0) {
-      if (line[colonPos + 1] === ' ') {
-        field = line.slice(0, colonPos);
-        value = line.slice(colonPos + 2); // ignores the first space from the value
-      } else {
-        field = line.slice(0, colonPos);
-        value = line.slice(colonPos + 1);
-      }
+  if (colonPos === 0) {
+    // this is a comment line and should be ignored
+    return;
+  } else if (colonPos > 0) {
+    if (line[colonPos + 1] === ' ') {
+      field = line.slice(0, colonPos);
+      value = line.slice(colonPos + 2); // ignores the first space from the value
     } else {
-      field = line;
-      value = '';
-      }
-
-      switch (field) {
-        case 'event':
-          // Set the type of this event
-          this._eventTypeBuf = value;
-          break;
-        case 'data':
-          // Append the line to the data buffer along with an LF (U+000A)
-          this._dataBuf += value;
-          this._dataBuf += String.fromCodePoint(lf);
-          break;
-        case 'id':
-          // Update the last seen event id
-          this._lastEventIdBuf = value;
-          break;
-        case 'retry':
-          // Set a new reconnect interval value
-          const newRetryMs = parseInt(value, 10);
-          if (!isNaN(newRetryMs)) {
-            this._reconnectIntervalMs = newRetryMs;
-          }
-          break;
-        default:
-        // this is an unrecognized field, so this line should be ignored
-      }
+      field = line.slice(0, colonPos);
+      value = line.slice(colonPos + 1);
     }
+  } else {
+    field = line;
+    value = '';
+  }
+
+  switch (field) {
+    case 'event':
+      // Set the type of this event
+      this._eventTypeBuf = value;
+      break;
+    case 'data':
+      // Append the line to the data buffer along with an LF (U+000A)
+      this._dataBuf += value;
+      this._dataBuf += String.fromCodePoint(lf);
+      break;
+    case 'id':
+      // Update the last seen event id
+      this._lastEventIdBuf = value;
+      break;
+    case 'retry':
+      // Set a new reconnect interval value
+      const newRetryMs = parseInt(value, 10);
+      if (!isNaN(newRetryMs)) {
+        this._reconnectIntervalMs = newRetryMs;
+      }
+      break;
+    default:
+    // this is an unrecognized field, so this line should be ignored
+  }
+}
 
     __dispatchBufferedEvent() {
     this._lastEventId = this._lastEventIdBuf;
