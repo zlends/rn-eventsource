@@ -238,7 +238,7 @@ class EventSource extends (EventTarget(...EVENT_SOURCE_EVENTS): any) {
         ++pos;
 
         // Free event loop
-        if (pos % 1000 === 0) {
+        if (pos % 100 === 0) {
           setTimeout(processNextChunk, 0);
           return;
         }
