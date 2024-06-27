@@ -237,8 +237,8 @@ class EventSource extends (EventTarget(...EVENT_SOURCE_EVENTS): any) {
 
         ++pos;
 
-        // Отпускаем event loop
-        if (pos % 1000 === 0) {
+        // Отпускаем event loop каждые 100 символов для еще большей оптимизации
+        if (pos % 100 === 0) {
           setTimeout(processNextChunk, 0);
           return;
         }
@@ -290,8 +290,14 @@ __processEventStreamLine(): void {
       break;
     case 'data':
       // Append the line to the data buffer along with an LF (U+000A)
-      this._dataBuf += value;
-      this._dataBuf += String.fromCodePoint(lf);
+      try {
+        JSON.parse(value); // Проверка корректности JSON
+        this._dataBuf += value;
+        this._dataBuf += String.fromCodePoint(lf);
+      } catch (e) {
+        console.error('JSON Parse error: ', e);
+        this._dataBuf = ''; // Сброс буфера данных при ошибке
+      }
       break;
     case 'id':
       // Update the last seen event id
